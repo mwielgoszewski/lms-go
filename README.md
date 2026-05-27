@@ -49,6 +49,39 @@ two private keys in the same state and thus when they are both used to sign a
 message, the LMOTS private keys will have been reused, which is considered **not
 good**.
 
+## HSS (Hierarchical Signature System)
+
+This repository also includes an implementation of HSS, the multi-tree
+extension of LMS defined in [RFC 8554, Section 6](https://datatracker.ietf.org/doc/html/rfc8554#section-6).
+HSS composes `L` LMS trees so a single top-level public key can sign
+`2^(h_0 + h_1 + ... + h_{L-1})` messages.
+
+```go
+import (
+    "github.com/trailofbits/lms-go/lms/common"
+    "github.com/trailofbits/lms-go/lms/hss"
+)
+
+lmsTypes := []common.LmsAlgorithmType{common.LMS_SHA256_M32_H10, common.LMS_SHA256_M32_H10}
+otsTypes := []common.LmsOtsAlgorithmType{common.LMOTS_SHA256_N32_W4, common.LMOTS_SHA256_N32_W4}
+
+priv, err := hss.NewPrivateKey(lmsTypes, otsTypes)
+pub      := priv.Public()
+sig, err := priv.Sign([]byte("example"), nil)
+valid    := pub.Verify([]byte("example"), sig)
+```
+
+### HSS State Management
+
+The same stateful-signing warning applies as for LMS, but multiplied across
+`L` levels. Callers MUST persist `priv.ToBytes()` after every successful
+`Sign` and before releasing the signature. Loading the same serialized HSS
+private key into two concurrent signers is a security vulnerability.
+
+`HssPrivateKey.ToBytes()` captures every level's `q` plus the cached
+intermediate signatures, so a reload-and-sign sequence advances state
+correctly without re-deriving lower-level keys.
+
 ## License
 
 This codebase is licensed under the [3-Clause BSD License](https://opensource.org/license/bsd-3-clause/).
