@@ -6,6 +6,9 @@ package lms
 import (
 	"encoding/binary"
 	"errors"
+	"runtime"
+	"sync"
+	"sync/atomic"
 
 	"github.com/trailofbits/lms-go/lms/common"
 	"github.com/trailofbits/lms-go/lms/ots"
@@ -219,49 +222,119 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 		return nil, err
 	}
 
-	var tree_nodes uint32 = (1 << (params.H + 1)) - 1
-	var leaves uint32 = 1 << params.H
-	var authtree = make([][]byte, tree_nodes)
-	var i uint32
-	var j uint32
+	tree_nodes := uint32(1)<<(params.H+1) - 1
+	leaves := uint32(1) << params.H
+	authtree := make([][]byte, tree_nodes)
 
-	var r uint32
-	var r_be [4]byte
-	for i = 0; i < leaves; i++ {
-		r = i + leaves
-		ots_priv, err := ots.NewPrivateKeyFromSeed(otstc, i, id, seed)
-		if err != nil {
-			return nil, err
-		}
-		ots_pub, err := ots_priv.Public()
-		if err != nil {
-			return nil, err
-		}
-
-		binary.BigEndian.PutUint32(r_be[:], r)
-
-		hasher := ots_params.H.New()
-		common.HashWrite(hasher, id[:])
-		common.HashWrite(hasher, r_be[:])
-		common.HashWrite(hasher, common.D_LEAF[:])
-		common.HashWrite(hasher, ots_pub.Key())
-		authtree[r-1] = common.HashSum(hasher, ots_params.N)
-
-		j = i
-		for j%2 == 1 {
-			r = (r - 1) >> 1
-			j = (j - 1) >> 1
-			hasher := ots_params.H.New()
-
-			binary.BigEndian.PutUint32(r_be[:], r)
-
-			common.HashWrite(hasher, id[:])
-			common.HashWrite(hasher, r_be[:])
-			common.HashWrite(hasher, common.D_INTR[:])
-			common.HashWrite(hasher, authtree[2*r-1])
-			common.HashWrite(hasher, authtree[2*r])
-			authtree[r-1] = common.HashSum(hasher, ots_params.N)
-		}
+	workers := runtime.NumCPU()
+	if uint32(workers) > leaves {
+		workers = int(leaves)
 	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var firstErr atomic.Value // stores error
+	var wg sync.WaitGroup
+	chunk := (leaves + uint32(workers) - 1) / uint32(workers)
+	for w := 0; w < workers; w++ {
+		start := uint32(w) * chunk
+		if start >= leaves {
+			break
+		}
+		end := start + chunk
+		if end > leaves {
+			end = leaves
+		}
+		wg.Add(1)
+		go func(start, end uint32) {
+			defer wg.Done()
+			var r_be [4]byte
+			for i := start; i < end; i++ {
+				if firstErr.Load() != nil {
+					return
+				}
+				r := i + leaves
+				ots_priv, err := ots.NewPrivateKeyFromSeed(otstc, i, id, seed)
+				if err != nil {
+					firstErr.CompareAndSwap(nil, err)
+					return
+				}
+				ots_pub, err := ots_priv.Public()
+				if err != nil {
+					firstErr.CompareAndSwap(nil, err)
+					return
+				}
+				binary.BigEndian.PutUint32(r_be[:], r)
+				hasher := ots_params.H.New()
+				common.HashWrite(hasher, id[:])
+				common.HashWrite(hasher, r_be[:])
+				common.HashWrite(hasher, common.D_LEAF[:])
+				common.HashWrite(hasher, ots_pub.Key())
+				authtree[r-1] = common.HashSum(hasher, ots_params.N)
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	if e := firstErr.Load(); e != nil {
+		return nil, e.(error)
+	}
+
+	const parallelThreshold = 1024
+	for level := int(params.H) - 1; level >= 0; level-- {
+		levelNodes := uint32(1) << uint(level)
+		rBase := uint32(1) << uint(level)
+
+		if levelNodes < parallelThreshold {
+			var r_be [4]byte
+			for idx := uint32(0); idx < levelNodes; idx++ {
+				r := rBase + idx
+				binary.BigEndian.PutUint32(r_be[:], r)
+				hasher := ots_params.H.New()
+				common.HashWrite(hasher, id[:])
+				common.HashWrite(hasher, r_be[:])
+				common.HashWrite(hasher, common.D_INTR[:])
+				common.HashWrite(hasher, authtree[2*r-1])
+				common.HashWrite(hasher, authtree[2*r])
+				authtree[r-1] = common.HashSum(hasher, ots_params.N)
+			}
+			continue
+		}
+
+		levelWorkers := workers
+		if uint32(levelWorkers) > levelNodes {
+			levelWorkers = int(levelNodes)
+		}
+		levelChunk := (levelNodes + uint32(levelWorkers) - 1) / uint32(levelWorkers)
+		var lwg sync.WaitGroup
+		for w := 0; w < levelWorkers; w++ {
+			start := uint32(w) * levelChunk
+			if start >= levelNodes {
+				break
+			}
+			end := start + levelChunk
+			if end > levelNodes {
+				end = levelNodes
+			}
+			lwg.Add(1)
+			go func(start, end uint32) {
+				defer lwg.Done()
+				var r_be [4]byte
+				for idx := start; idx < end; idx++ {
+					r := rBase + idx
+					binary.BigEndian.PutUint32(r_be[:], r)
+					hasher := ots_params.H.New()
+					common.HashWrite(hasher, id[:])
+					common.HashWrite(hasher, r_be[:])
+					common.HashWrite(hasher, common.D_INTR[:])
+					common.HashWrite(hasher, authtree[2*r-1])
+					common.HashWrite(hasher, authtree[2*r])
+					authtree[r-1] = common.HashSum(hasher, ots_params.N)
+				}
+			}(start, end)
+		}
+		lwg.Wait()
+	}
+
 	return authtree, nil
 }
