@@ -92,12 +92,21 @@ func TestGeneratePKTreeParallelMatchesSerial(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(got) != len(want) {
-				t.Fatalf("tree length mismatch: got %d, want %d", len(got), len(want))
+			otsParams, err := tt.otstc.Params()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stride := otsParams.H.New().Size()
+			n := int(otsParams.N)
+			if len(got) != len(want)*stride {
+				t.Fatalf("tree length mismatch: got %d bytes, want %d nodes × %d stride = %d",
+					len(got), len(want), stride, len(want)*stride)
 			}
 			for i := range want {
-				if !bytes.Equal(got[i], want[i]) {
-					t.Fatalf("tree node %d differs:\n got  %x\n want %x", i, got[i], want[i])
+				off := i * stride
+				gotNode := got[off : off+n]
+				if !bytes.Equal(gotNode, want[i]) {
+					t.Fatalf("tree node %d differs:\n got  %x\n want %x", i, gotNode, want[i])
 				}
 			}
 		})

@@ -61,13 +61,19 @@ func NewPrivateKeyFromSeed(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgori
 	if err != nil {
 		return LmsPrivateKey{}, err
 	}
+	otsParams, err := otstc.Params()
+	if err != nil {
+		return LmsPrivateKey{}, err
+	}
 	return LmsPrivateKey{
-		typecode: tc,
-		otstype:  otstc,
-		q:        0,
-		id:       id,
-		seed:     seed,
-		authtree: tree,
+		typecode:   tc,
+		otstype:    otstc,
+		q:          0,
+		id:         id,
+		seed:       seed,
+		authtree:   tree,
+		nodeStride: otsParams.H.New().Size(),
+		nodeWidth:  int(otsParams.N),
 	}, nil
 }
 
@@ -77,7 +83,7 @@ func (priv *LmsPrivateKey) Public() LmsPublicKey {
 		typecode: priv.typecode,
 		otstype:  priv.otstype,
 		id:       priv.id,
-		k:        priv.authtree[0],
+		k:        priv.authNode(0),
 	}
 }
 
@@ -112,7 +118,7 @@ func (priv *LmsPrivateKey) Sign(msg []byte, rng io.Reader) (LmsSignature, error)
 	for i := 0; i < height; i++ {
 		temp = (r >> i) ^ 1
 		// We use x-1 because T[x] is indexed from 1, not 0, in the spec
-		authpath[i] = priv.authtree[temp-1][:]
+		authpath[i] = priv.authNode(temp - 1)
 	}
 
 	// We incremenet q to signal the this keys should not be reused
@@ -211,32 +217,28 @@ func LmsPrivateKeyFromBytes(b []byte) (LmsPrivateKey, error) {
 	return privateKey, nil
 }
 
-// leafHash computes the LMS Merkle leaf for tree index r = leaves+i, writing
-// the first otsParams.N bytes of the result into dst. The chain step inputs
-// are pre-staged into inputBuf so each inner hash takes a single Write; the
-// caller owns the hashers and scratch buffers so they can be reused across
-// many leaves.
+// leafHash computes the LMS Merkle leaf for tree-index r = leaves+i, writing
+// the first otsParams.N bytes of the result into dst. Each per-leaf hash is
+// fed a single Write call from a pre-staged scratch buffer; the caller owns
+// the hashers and buffers so they can be reused across leaves.
 func leafHash(
 	otsParams common.LmsOtsParam,
 	leafIdx, r uint32,
 	id common.ID,
 	seed []byte,
 	outerHasher, innerHasher, leafHasher hash.Hash,
-	chainBuf, inputBuf, dst []byte,
+	chainBuf, inputBuf, outerInputBuf, leafInputBuf, dst []byte,
 ) {
 	n := int(otsParams.N)
 	seedLen := len(seed)
 	chainEnd := (uint64(1) << int(otsParams.W.Window())) - 1
 
-	var rBE [4]byte
+	copy(outerInputBuf[0:16], id[:])
+	binary.BigEndian.PutUint32(outerInputBuf[16:20], leafIdx)
+	copy(outerInputBuf[20:22], common.D_PBLC[:])
 
 	copy(inputBuf[0:16], id[:])
 	binary.BigEndian.PutUint32(inputBuf[16:20], leafIdx)
-	binary.BigEndian.PutUint32(rBE[:], r)
-
-	outerHasher.Reset()
-	common.HashWrite(outerHasher, inputBuf[0:20])
-	common.HashWrite(outerHasher, common.D_PBLC[:])
 
 	seedSlice := inputBuf[:23+seedLen]
 	chainSlice := inputBuf[:23+n]
@@ -257,22 +259,38 @@ func leafHash(
 			innerHasher.Sum(sumDst)
 		}
 
-		common.HashWrite(outerHasher, inputBuf[23:23+n])
+		slot := 22 + int(chainI)*n
+		copy(outerInputBuf[slot:slot+n], inputBuf[23:23+n])
 	}
 
+	outerHasher.Reset()
+	common.HashWrite(outerHasher, outerInputBuf[:22+int(otsParams.P)*n])
 	outerHasher.Sum(chainBuf[:0])
 
+	copy(leafInputBuf[0:16], id[:])
+	binary.BigEndian.PutUint32(leafInputBuf[16:20], r)
+	copy(leafInputBuf[20:22], common.D_LEAF[:])
+	copy(leafInputBuf[22:22+n], chainBuf[:n])
+
 	leafHasher.Reset()
-	common.HashWrite(leafHasher, id[:])
-	common.HashWrite(leafHasher, rBE[:])
-	common.HashWrite(leafHasher, common.D_LEAF[:])
-	common.HashWrite(leafHasher, chainBuf[:n])
+	common.HashWrite(leafHasher, leafInputBuf[:22+n])
 	leafHasher.Sum(dst[:0])
 }
 
-// GeneratePKTree generates the Merkle Tree needed to derive the public key and
-// authentication path for any message.
-func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) ([][]byte, error) {
+// nodeSlot returns the slice view of tree node idx in the flat backing
+// buffer with len = n and cap = stride, so hash.Hash.Sum can write the full
+// digest into the slot without allocating.
+func nodeSlot(backing []byte, idx uint32, stride, n int) []byte {
+	off := int(idx) * stride
+	return backing[off : off+n : off+stride]
+}
+
+// GeneratePKTree generates the LMS Merkle tree used to derive the public key
+// and authentication paths. The tree is returned as one contiguous []byte:
+// node T[r] (RFC 8554, 1-based) lives at out[(r-1)*stride : (r-1)*stride+n]
+// where stride is the underlying hash's full digest size and n is the LMS
+// truncation length M.
+func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) ([]byte, error) {
 	params, err := tc.LmsParams()
 	if err != nil {
 		return nil, err
@@ -287,12 +305,7 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 
 	fullDigest := ots_params.H.New().Size()
 	n := int(ots_params.N)
-	treeBacking := make([]byte, int(tree_nodes)*fullDigest)
-	authtree := make([][]byte, tree_nodes)
-	for i := uint32(0); i < tree_nodes; i++ {
-		off := int(i) * fullDigest
-		authtree[i] = treeBacking[off : off+n : off+fullDigest]
-	}
+	authtree := make([]byte, int(tree_nodes)*fullDigest)
 
 	workers := runtime.NumCPU()
 	if uint32(workers) > leaves {
@@ -326,13 +339,16 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 				inputCap = 23 + len(seed)
 			}
 			inputBuf := make([]byte, inputCap)
+			outerInputBuf := make([]byte, 22+int(ots_params.P)*int(ots_params.N))
+			leafInputBuf := make([]byte, 22+int(ots_params.N), 22+fullDigest)
 			for i := start; i < end; i++ {
 				if firstErr.Load() != nil {
 					return
 				}
 				r := i + leaves
 				leafHash(ots_params, i, r, id, seed,
-					outer, inner, leaf, chainBuf, inputBuf, authtree[r-1])
+					outer, inner, leaf, chainBuf, inputBuf, outerInputBuf, leafInputBuf,
+					nodeSlot(authtree, r-1, fullDigest, n))
 			}
 		}(start, end)
 	}
@@ -356,9 +372,9 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 				common.HashWrite(hasher, id[:])
 				common.HashWrite(hasher, r_be[:])
 				common.HashWrite(hasher, common.D_INTR[:])
-				common.HashWrite(hasher, authtree[2*r-1])
-				common.HashWrite(hasher, authtree[2*r])
-				hasher.Sum(authtree[r-1][:0])
+				common.HashWrite(hasher, nodeSlot(authtree, 2*r-1, fullDigest, n))
+				common.HashWrite(hasher, nodeSlot(authtree, 2*r, fullDigest, n))
+				hasher.Sum(nodeSlot(authtree, r-1, fullDigest, n)[:0])
 			}
 			continue
 		}
@@ -390,9 +406,9 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 					common.HashWrite(hasher, id[:])
 					common.HashWrite(hasher, r_be[:])
 					common.HashWrite(hasher, common.D_INTR[:])
-					common.HashWrite(hasher, authtree[2*r-1])
-					common.HashWrite(hasher, authtree[2*r])
-					hasher.Sum(authtree[r-1][:0])
+					common.HashWrite(hasher, nodeSlot(authtree, 2*r-1, fullDigest, n))
+					common.HashWrite(hasher, nodeSlot(authtree, 2*r, fullDigest, n))
+					hasher.Sum(nodeSlot(authtree, r-1, fullDigest, n)[:0])
 				}
 			}(start, end)
 		}
