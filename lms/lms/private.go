@@ -6,6 +6,7 @@ package lms
 import (
 	"encoding/binary"
 	"errors"
+	"hash"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -210,6 +211,65 @@ func LmsPrivateKeyFromBytes(b []byte) (LmsPrivateKey, error) {
 	return privateKey, nil
 }
 
+// leafHash computes the LMS Merkle leaf for tree index r = leaves+i, writing
+// the first otsParams.N bytes of the result into dst. The chain step inputs
+// are pre-staged into inputBuf so each inner hash takes a single Write; the
+// caller owns the hashers and scratch buffers so they can be reused across
+// many leaves.
+func leafHash(
+	otsParams common.LmsOtsParam,
+	leafIdx, r uint32,
+	id common.ID,
+	seed []byte,
+	outerHasher, innerHasher, leafHasher hash.Hash,
+	chainBuf, inputBuf, dst []byte,
+) {
+	n := int(otsParams.N)
+	seedLen := len(seed)
+	chainEnd := (uint64(1) << int(otsParams.W.Window())) - 1
+
+	var rBE [4]byte
+
+	copy(inputBuf[0:16], id[:])
+	binary.BigEndian.PutUint32(inputBuf[16:20], leafIdx)
+	binary.BigEndian.PutUint32(rBE[:], r)
+
+	outerHasher.Reset()
+	common.HashWrite(outerHasher, inputBuf[0:20])
+	common.HashWrite(outerHasher, common.D_PBLC[:])
+
+	seedSlice := inputBuf[:23+seedLen]
+	chainSlice := inputBuf[:23+n]
+	sumDst := inputBuf[23:23]
+	for chainI := uint64(0); chainI < otsParams.P; chainI++ {
+		binary.BigEndian.PutUint16(inputBuf[20:22], uint16(chainI))
+
+		inputBuf[22] = 0xff
+		copy(inputBuf[23:23+seedLen], seed)
+		innerHasher.Reset()
+		common.HashWrite(innerHasher, seedSlice)
+		innerHasher.Sum(sumDst)
+
+		for j := uint64(0); j < chainEnd; j++ {
+			inputBuf[22] = byte(j)
+			innerHasher.Reset()
+			common.HashWrite(innerHasher, chainSlice)
+			innerHasher.Sum(sumDst)
+		}
+
+		common.HashWrite(outerHasher, inputBuf[23:23+n])
+	}
+
+	outerHasher.Sum(chainBuf[:0])
+
+	leafHasher.Reset()
+	common.HashWrite(leafHasher, id[:])
+	common.HashWrite(leafHasher, rBE[:])
+	common.HashWrite(leafHasher, common.D_LEAF[:])
+	common.HashWrite(leafHasher, chainBuf[:n])
+	leafHasher.Sum(dst[:0])
+}
+
 // GeneratePKTree generates the Merkle Tree needed to derive the public key and
 // authentication path for any message.
 func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) ([][]byte, error) {
@@ -224,7 +284,15 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 
 	tree_nodes := uint32(1)<<(params.H+1) - 1
 	leaves := uint32(1) << params.H
+
+	fullDigest := ots_params.H.New().Size()
+	n := int(ots_params.N)
+	treeBacking := make([]byte, int(tree_nodes)*fullDigest)
 	authtree := make([][]byte, tree_nodes)
+	for i := uint32(0); i < tree_nodes; i++ {
+		off := int(i) * fullDigest
+		authtree[i] = treeBacking[off : off+n : off+fullDigest]
+	}
 
 	workers := runtime.NumCPU()
 	if uint32(workers) > leaves {
@@ -249,29 +317,22 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 		wg.Add(1)
 		go func(start, end uint32) {
 			defer wg.Done()
-			var r_be [4]byte
+			outer := ots_params.H.New()
+			inner := ots_params.H.New()
+			leaf := ots_params.H.New()
+			chainBuf := make([]byte, fullDigest)
+			inputCap := 23 + fullDigest
+			if 23+len(seed) > inputCap {
+				inputCap = 23 + len(seed)
+			}
+			inputBuf := make([]byte, inputCap)
 			for i := start; i < end; i++ {
 				if firstErr.Load() != nil {
 					return
 				}
 				r := i + leaves
-				ots_priv, err := ots.NewPrivateKeyFromSeed(otstc, i, id, seed)
-				if err != nil {
-					firstErr.CompareAndSwap(nil, err)
-					return
-				}
-				ots_pub, err := ots_priv.Public()
-				if err != nil {
-					firstErr.CompareAndSwap(nil, err)
-					return
-				}
-				binary.BigEndian.PutUint32(r_be[:], r)
-				hasher := ots_params.H.New()
-				common.HashWrite(hasher, id[:])
-				common.HashWrite(hasher, r_be[:])
-				common.HashWrite(hasher, common.D_LEAF[:])
-				common.HashWrite(hasher, ots_pub.Key())
-				authtree[r-1] = common.HashSum(hasher, ots_params.N)
+				leafHash(ots_params, i, r, id, seed,
+					outer, inner, leaf, chainBuf, inputBuf, authtree[r-1])
 			}
 		}(start, end)
 	}
@@ -287,16 +348,17 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 
 		if levelNodes < parallelThreshold {
 			var r_be [4]byte
+			hasher := ots_params.H.New()
 			for idx := uint32(0); idx < levelNodes; idx++ {
 				r := rBase + idx
 				binary.BigEndian.PutUint32(r_be[:], r)
-				hasher := ots_params.H.New()
+				hasher.Reset()
 				common.HashWrite(hasher, id[:])
 				common.HashWrite(hasher, r_be[:])
 				common.HashWrite(hasher, common.D_INTR[:])
 				common.HashWrite(hasher, authtree[2*r-1])
 				common.HashWrite(hasher, authtree[2*r])
-				authtree[r-1] = common.HashSum(hasher, ots_params.N)
+				hasher.Sum(authtree[r-1][:0])
 			}
 			continue
 		}
@@ -320,16 +382,17 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 			go func(start, end uint32) {
 				defer lwg.Done()
 				var r_be [4]byte
+				hasher := ots_params.H.New()
 				for idx := start; idx < end; idx++ {
 					r := rBase + idx
 					binary.BigEndian.PutUint32(r_be[:], r)
-					hasher := ots_params.H.New()
+					hasher.Reset()
 					common.HashWrite(hasher, id[:])
 					common.HashWrite(hasher, r_be[:])
 					common.HashWrite(hasher, common.D_INTR[:])
 					common.HashWrite(hasher, authtree[2*r-1])
 					common.HashWrite(hasher, authtree[2*r])
-					authtree[r-1] = common.HashSum(hasher, ots_params.N)
+					hasher.Sum(authtree[r-1][:0])
 				}
 			}(start, end)
 		}

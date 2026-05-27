@@ -36,23 +36,24 @@ func NewPrivateKeyFromSeed(tc common.LmsOtsAlgorithmType, q uint32, id common.ID
 	if err != nil {
 		return LmsOtsPrivateKey{}, err
 	}
+	n := int(params.N)
+	backing := make([]byte, int(params.P)*n)
 	x := make([][]byte, params.P)
-
+	hasher := params.H.New()
+	var q_be [4]byte
+	var i_be [2]byte
+	binary.BigEndian.PutUint32(q_be[:], q)
+	ff := [1]byte{0xff}
 	for i := uint64(0); i < params.P; i++ {
-		var q_be [4]byte
-		var i_be [2]byte
-		hasher := params.H.New()
-
-		binary.BigEndian.PutUint32(q_be[:], q)
 		binary.BigEndian.PutUint16(i_be[:], uint16(i))
-
+		hasher.Reset()
 		common.HashWrite(hasher, id[:])
 		common.HashWrite(hasher, q_be[:])
 		common.HashWrite(hasher, i_be[:])
-		common.HashWrite(hasher, []byte{0xff})
+		common.HashWrite(hasher, ff[:])
 		common.HashWrite(hasher, seed)
-
-		x[i] = common.HashSum(hasher, params.N)
+		slot := backing[int(i)*n : int(i)*n : int(i)*n+n]
+		x[i] = hasher.Sum(slot)[:n]
 	}
 
 	return LmsOtsPrivateKey{
@@ -68,38 +69,38 @@ func NewPrivateKeyFromSeed(tc common.LmsOtsAlgorithmType, q uint32, id common.ID
 func (x *LmsOtsPrivateKey) Public() (LmsOtsPublicKey, error) {
 	var be16 [2]byte
 	var be32 [4]byte
-	var tmp []byte
 	params, err := x.typecode.Params()
 	if err != nil {
 		return LmsOtsPublicKey{}, err
 	}
+	n := int(params.N)
 	hasher := params.H.New()
+	inner := params.H.New()
+	tmp := make([]byte, hasher.Size())
+	jbyte := [1]byte{}
 	binary.BigEndian.PutUint32(be32[:], x.q)
 
 	common.HashWrite(hasher, x.id[:])
 	common.HashWrite(hasher, be32[:])
 	common.HashWrite(hasher, common.D_PBLC[:])
 
+	chainEnd := (uint64(1) << int(params.W.Window())) - 1
 	for i := uint64(0); i < params.P; i++ {
-		tmp = make([]byte, len(x.x[i]))
-		copy(tmp, x.x[i])
+		copy(tmp[:n], x.x[i])
+		binary.BigEndian.PutUint16(be16[:], uint16(i))
 
-		for j := uint64(0); j < (uint64(1)<<int(params.W.Window()))-1; j++ {
-			inner := params.H.New()
-
-			binary.BigEndian.PutUint32(be32[:], x.q)
-			binary.BigEndian.PutUint16(be16[:], uint16(i))
-
+		for j := uint64(0); j < chainEnd; j++ {
+			jbyte[0] = byte(j)
+			inner.Reset()
 			common.HashWrite(inner, x.id[:])
 			common.HashWrite(inner, be32[:])
 			common.HashWrite(inner, be16[:])
-			common.HashWrite(inner, []byte{byte(j)})
-			common.HashWrite(inner, tmp)
-
-			tmp = common.HashSum(inner, params.N)
+			common.HashWrite(inner, jbyte[:])
+			common.HashWrite(inner, tmp[:n])
+			inner.Sum(tmp[:0])
 		}
 
-		common.HashWrite(hasher, tmp)
+		common.HashWrite(hasher, tmp[:n])
 	}
 
 	return LmsOtsPublicKey{
