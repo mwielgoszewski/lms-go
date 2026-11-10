@@ -49,6 +49,24 @@ two private keys in the same state and thus when they are both used to sign a
 message, the LMOTS private keys will have been reused, which is considered **not
 good**.
 
+### Reusing authentication trees
+
+`privateKey.AuthenticationTree()` returns an immutable handle to the public
+Merkle tree. `lms.LmsPrivateKeyFromBytesWithTree(ctx, serialized, tree)` reuses
+that backing memory while restoring the counter from `serialized`. Passing a
+nil tree rebuilds it; cancellation interrupts construction between leaves and
+internal nodes. The original constructors and deserializer remain available.
+
+The handle contains neither a private seed nor a signing counter. A digest
+binds it to the LMS/LM-OTS algorithms, identifier, and seed, so loading a different
+key with the same handle returns an error. `tree.Size()` reports its retained
+backing bytes for a caller-managed cache budget. H20 trees currently retain just
+under 64 MiB each.
+
+Tree reuse does **not** reserve indices or persist counters. Applications must
+serialize signing, durably reserve each index before use, and commit updated
+state before releasing signatures. A cache must never restore an old counter.
+
 ## License
 
 This codebase is licensed under the [3-Clause BSD License](https://opensource.org/license/bsd-3-clause/).
