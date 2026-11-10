@@ -5,7 +5,9 @@ import (
 	"github.com/trailofbits/lms-go/lms/ots"
 )
 
-// A LmsPrivateKey is used to sign a finite number of messages.
+// A LmsPrivateKey is used to sign a finite number of messages. Do not copy a
+// live key by value or call Sign concurrently on it: copies duplicate Q, and
+// signing does not synchronize or enforce the caller's reserved index range.
 //
 // authtree is the Merkle tree as one contiguous []byte; node T[r] (RFC 8554,
 // 1-based) lives at authtree[(r-1)*nodeStride : (r-1)*nodeStride+nodeWidth].

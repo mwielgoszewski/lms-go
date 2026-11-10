@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,4 +95,112 @@ func TestTreeConstructionCancellation(t *testing.T) {
 	_, err = NewPrivateKeyContext(ctx, common.LMS_SHA256_M32_H20, common.LMOTS_SHA256_N32_W8)
 	require.True(t, errors.Is(err, context.DeadlineExceeded))
 	require.Less(t, time.Since(start), 5*time.Second)
+}
+
+// Every worker owns exactly one preallocated index. Signing twice from any
+// restored object would exceed that worker's reservation, even though the
+// library's counter has room to advance.
+func TestAuthenticationTreeConcurrentReservedIndices(t *testing.T) {
+	for _, tc := range []common.LmsAlgorithmType{common.LMS_SHA256_M32_H5, common.LMS_SHA256_M24_H5} {
+		t.Run(fmt.Sprint(tc), func(t *testing.T) {
+			ot := common.LMOTS_SHA256_N32_W4
+			if tc == common.LMS_SHA256_M24_H5 {
+				ot = common.LMOTS_SHA256_N24_W4
+			}
+			key, err := NewPrivateKey(tc, ot)
+			require.NoError(t, err)
+			public := key.Public()
+			tree := key.AuthenticationTree()
+			before := append([]byte(nil), tree.nodes...)
+			const workers = 32
+			// Stand in for the caller's completed durable reservation of [0, 32).
+			// Each worker gets a separate serialization with its assigned index.
+			inputs := make([][]byte, workers)
+			for i := range inputs {
+				inputs[i] = key.ToBytes()
+				binary.BigEndian.PutUint32(inputs[i][8:12], uint32(i))
+			}
+			sigs := make([]LmsSignature, workers)
+			errs := make([]error, workers)
+			var wg sync.WaitGroup
+			for i := range inputs {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					restored, err := LmsPrivateKeyFromBytesWithTree(context.Background(), inputs[i], tree)
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					sigs[i], errs[i] = restored.Sign([]byte(fmt.Sprint("message-", i)), nil)
+				}(i)
+			}
+			wg.Wait()
+			for i, sig := range sigs {
+				require.NoError(t, errs[i])
+				require.Equal(t, uint32(i), sig.q)
+				require.True(t, public.Verify([]byte(fmt.Sprint("message-", i)), sig))
+			}
+			require.Equal(t, before, tree.nodes, "signing must not mutate the shared tree")
+		})
+	}
+}
+
+func TestRestoredKeyOwnsSerializedInput(t *testing.T) {
+	key, err := NewPrivateKey(common.LMS_SHA256_M32_H5, common.LMOTS_SHA256_N32_W4)
+	require.NoError(t, err)
+	public := key.Public()
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprint("cached=", cached), func(t *testing.T) {
+			encoded := key.ToBytes()
+			q := uint32(0)
+			if cached {
+				q = 1
+			} // disjoint indices for the same key
+			binary.BigEndian.PutUint32(encoded[8:12], q)
+			var tree *AuthenticationTree
+			if cached {
+				tree = key.AuthenticationTree()
+			}
+			restored, err := LmsPrivateKeyFromBytesWithTree(context.Background(), encoded, tree)
+			require.NoError(t, err)
+			for i := range encoded {
+				encoded[i] ^= 0xff
+			}
+			sig, err := restored.Sign([]byte("message"), nil)
+			require.NoError(t, err)
+			require.Equal(t, q, sig.q)
+			require.True(t, public.Verify([]byte("message"), sig))
+		})
+	}
+}
+
+// Signatures must not retain or alias the entire tree after a cache eviction.
+// Mutating a signature path here uses package-private access deliberately:
+// an alias would both pin the backing allocation and corrupt other signers.
+func TestSignatureOwnsAuthenticationPath(t *testing.T) {
+	for _, tc := range []common.LmsAlgorithmType{common.LMS_SHA256_M32_H5, common.LMS_SHA256_M24_H5} {
+		t.Run(fmt.Sprint(tc), func(t *testing.T) {
+			ot := common.LMOTS_SHA256_N32_W4
+			if tc == common.LMS_SHA256_M24_H5 {
+				ot = common.LMOTS_SHA256_N24_W4
+			}
+			key, err := NewPrivateKey(tc, ot)
+			require.NoError(t, err)
+			public := key.Public()
+			before := append([]byte(nil), key.authtree...)
+			sig, err := key.Sign([]byte("first"), nil)
+			require.NoError(t, err)
+			require.True(t, public.Verify([]byte("first"), sig))
+			for _, node := range sig.path {
+				for i := range node {
+					node[i] ^= 0xff
+				}
+			}
+			require.Equal(t, before, key.authtree, "signature paths must not alias tree memory")
+			next, err := key.Sign([]byte("second"), nil)
+			require.NoError(t, err)
+			require.True(t, public.Verify([]byte("second"), next))
+		})
+	}
 }

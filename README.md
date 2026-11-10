@@ -67,6 +67,15 @@ Tree reuse does **not** reserve indices or persist counters. Applications must
 serialize signing, durably reserve each index before use, and commit updated
 state before releasing signatures. A cache must never restore an old counter.
 
+A shared tree does not coordinate its private-key objects. Each restored object
+may sign only indices durably reserved for that object: normally **one signature
+per restore**, unless the application reserves disjoint ranges and enforces
+their limits. For example, restoring A at Q=5 and B at Q=6 permits one signature
+from each; a second signature from A would also use Q=6 and reuse B's one-time
+key. `Sign` advances Q but does not enforce reservation boundaries. Never copy a
+live `LmsPrivateKey` by value (the copy duplicates Q), or call `Sign` concurrently
+on the same object.
+
 ## License
 
 This codebase is licensed under the [3-Clause BSD License](https://opensource.org/license/bsd-3-clause/).

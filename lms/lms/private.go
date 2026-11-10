@@ -126,13 +126,19 @@ func (priv *LmsPrivateKey) Sign(msg []byte, rng io.Reader) (LmsSignature, error)
 		return LmsSignature{}, err
 	}
 	authpath := make([][]byte, params.H)
+	// A signature owns its H authentication nodes, rather than retaining or
+	// exposing the entire shared tree. One backing allocation keeps the copy
+	// small (640 bytes for H20/M32).
+	pathNodes := make([]byte, height*priv.nodeWidth)
 
 	var r uint32 = leaves + priv.q
 	var temp uint32
 	for i := 0; i < height; i++ {
 		temp = (r >> i) ^ 1
 		// We use x-1 because T[x] is indexed from 1, not 0, in the spec
-		authpath[i] = priv.authNode(temp - 1)
+		off := i * priv.nodeWidth
+		authpath[i] = pathNodes[off : off+priv.nodeWidth : off+priv.nodeWidth]
+		copy(authpath[i], priv.authNode(temp-1))
 	}
 
 	// We incremenet q to signal the this keys should not be reused

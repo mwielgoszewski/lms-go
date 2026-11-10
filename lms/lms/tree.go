@@ -22,8 +22,11 @@ type AuthenticationTree struct {
 func (t *AuthenticationTree) Size() int64 { return int64(len(t.nodes)) }
 
 // AuthenticationTree returns a read-only handle sharing this key's tree.
-// The handle can outlive the private key and be reused concurrently by keys
-// restored from independently reserved counters.
+// The handle can outlive the private key and be shared across restored keys.
+// Each restored key may sign only indices durably reserved for that object:
+// normally one signature per restore, unless the caller reserves a disjoint
+// range. Sign increments Q but does not enforce reservation boundaries. Never
+// copy a live LmsPrivateKey by value or call Sign concurrently on one object.
 func (priv *LmsPrivateKey) AuthenticationTree() *AuthenticationTree {
 	return &AuthenticationTree{
 		nodes:    priv.authtree,
