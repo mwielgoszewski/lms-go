@@ -4,12 +4,12 @@
 package lms
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"hash"
 	"runtime"
 	"sync"
-	"sync/atomic"
 
 	"github.com/trailofbits/lms-go/lms/common"
 	"github.com/trailofbits/lms-go/lms/ots"
@@ -21,6 +21,14 @@ import (
 // NewPrivateKey returns a LmsPrivateKey, seeded by a cryptographically secure
 // random number generator.
 func NewPrivateKey(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType) (LmsPrivateKey, error) {
+	return NewPrivateKeyContext(context.Background(), tc, otstc)
+}
+
+// NewPrivateKeyContext is NewPrivateKey with cancellable tree construction.
+func NewPrivateKeyContext(ctx context.Context, tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType) (LmsPrivateKey, error) {
+	if err := ctx.Err(); err != nil {
+		return LmsPrivateKey{}, err
+	}
 	var err error
 	tc, err = tc.LmsType()
 	if err != nil {
@@ -43,12 +51,17 @@ func NewPrivateKey(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType)
 	}
 	id := common.ID(idbytes)
 
-	return NewPrivateKeyFromSeed(tc, otstc, id, seed)
+	return NewPrivateKeyFromSeedContext(ctx, tc, otstc, id, seed)
 }
 
 // NewPrivateKeyFromSeed returns a new LmsPrivateKey, using the algorithm from
 // Appendix A of <https://datatracker.ietf.org/doc/html/rfc8554#appendix-A>
 func NewPrivateKeyFromSeed(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) (LmsPrivateKey, error) {
+	return NewPrivateKeyFromSeedContext(context.Background(), tc, otstc, id, seed)
+}
+
+// NewPrivateKeyFromSeedContext is NewPrivateKeyFromSeed with cancellable tree construction.
+func NewPrivateKeyFromSeedContext(ctx context.Context, tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) (LmsPrivateKey, error) {
 	tc, err := tc.LmsType()
 	if err != nil {
 		return LmsPrivateKey{}, err
@@ -57,7 +70,8 @@ func NewPrivateKeyFromSeed(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgori
 	if err != nil {
 		return LmsPrivateKey{}, err
 	}
-	tree, err := GeneratePKTree(tc, otstc, id, seed)
+	seed = append([]byte(nil), seed...)
+	tree, err := GeneratePKTreeContext(ctx, tc, otstc, id, seed)
 	if err != nil {
 		return LmsPrivateKey{}, err
 	}
@@ -83,7 +97,7 @@ func (priv *LmsPrivateKey) Public() LmsPublicKey {
 		typecode: priv.typecode,
 		otstype:  priv.otstype,
 		id:       priv.id,
-		k:        priv.authNode(0),
+		k:        append([]byte(nil), priv.authNode(0)...),
 	}
 }
 
@@ -112,13 +126,19 @@ func (priv *LmsPrivateKey) Sign(msg []byte, rng io.Reader) (LmsSignature, error)
 		return LmsSignature{}, err
 	}
 	authpath := make([][]byte, params.H)
+	// A signature owns its H authentication nodes, rather than retaining or
+	// exposing the entire shared tree. One backing allocation keeps the copy
+	// small (640 bytes for H20/M32).
+	pathNodes := make([]byte, height*priv.nodeWidth)
 
 	var r uint32 = leaves + priv.q
 	var temp uint32
 	for i := 0; i < height; i++ {
 		temp = (r >> i) ^ 1
 		// We use x-1 because T[x] is indexed from 1, not 0, in the spec
-		authpath[i] = priv.authNode(temp - 1)
+		off := i * priv.nodeWidth
+		authpath[i] = pathNodes[off : off+priv.nodeWidth : off+priv.nodeWidth]
+		copy(authpath[i], priv.authNode(temp-1))
 	}
 
 	// We incremenet q to signal the this keys should not be reused
@@ -178,6 +198,17 @@ func (priv *LmsPrivateKey) Q() uint32 {
 // LmsPrivateKeyFromBytes returns an LmsPrivateKey that represents b.
 // This is the inverse of the ToBytes() method on the LmsPrivateKey object.
 func LmsPrivateKeyFromBytes(b []byte) (LmsPrivateKey, error) {
+	return LmsPrivateKeyFromBytesWithTree(context.Background(), b, nil)
+}
+
+// LmsPrivateKeyFromBytesWithTree restores the persisted counter and private key.
+// A nil tree constructs a new tree, observing ctx; a non-nil tree must belong
+// to exactly the same key material. The caller still owns durable counter
+// management: restoring the same counter twice can reuse a one-time key.
+func LmsPrivateKeyFromBytesWithTree(ctx context.Context, b []byte, tree *AuthenticationTree) (LmsPrivateKey, error) {
+	if err := ctx.Err(); err != nil {
+		return LmsPrivateKey{}, err
+	}
 	if len(b) < 8 {
 		return LmsPrivateKey{}, errors.New("LmsPrivateKeyFromBytes(): Input is too short")
 	}
@@ -208,8 +239,26 @@ func LmsPrivateKeyFromBytes(b []byte) (LmsPrivateKey, error) {
 	seed_end := lmsparams.M + 28
 	seed := b[28:seed_end]
 
-	// Load private key, then set q to what was persisted
-	privateKey, err := NewPrivateKeyFromSeed(typecode, otstype, id, seed)
+	if q > uint32(1)<<lmsparams.H {
+		return LmsPrivateKey{}, errors.New("LmsPrivateKeyFromBytes(): counter exceeds tree capacity")
+	}
+	if tree != nil {
+		if len(tree.nodes) == 0 || tree.identity != treeIdentity(typecode, otstype, id, seed) {
+			return LmsPrivateKey{}, errors.New("LmsPrivateKeyFromBytesWithTree(): tree belongs to a different key")
+		}
+		return LmsPrivateKey{
+			typecode:   typecode,
+			otstype:    otstype,
+			q:          q,
+			id:         id,
+			seed:       append([]byte(nil), seed...),
+			authtree:   tree.nodes,
+			nodeStride: tree.stride,
+			nodeWidth:  tree.width,
+		}, nil
+	}
+	// Load private key, then set q to what was persisted.
+	privateKey, err := NewPrivateKeyFromSeedContext(ctx, typecode, otstype, id, seed)
 	if err != nil {
 		return LmsPrivateKey{}, err
 	}
@@ -291,6 +340,15 @@ func nodeSlot(backing []byte, idx uint32, stride, n int) []byte {
 // where stride is the underlying hash's full digest size and n is the LMS
 // truncation length M.
 func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) ([]byte, error) {
+	return GeneratePKTreeContext(context.Background(), tc, otstc, id, seed)
+}
+
+// GeneratePKTreeContext is GeneratePKTree with cancellation between leaves and
+// internal nodes. It waits for all workers to stop before returning an error.
+func GeneratePKTreeContext(ctx context.Context, tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType, id common.ID, seed []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	params, err := tc.LmsParams()
 	if err != nil {
 		return nil, err
@@ -315,7 +373,6 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 		workers = 1
 	}
 
-	var firstErr atomic.Value // stores error
 	var wg sync.WaitGroup
 	chunk := (leaves + uint32(workers) - 1) / uint32(workers)
 	for w := 0; w < workers; w++ {
@@ -342,7 +399,7 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 			outerInputBuf := make([]byte, 22+int(ots_params.P)*int(ots_params.N))
 			leafInputBuf := make([]byte, 22+int(ots_params.N), 22+fullDigest)
 			for i := start; i < end; i++ {
-				if firstErr.Load() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				r := i + leaves
@@ -353,8 +410,8 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 		}(start, end)
 	}
 	wg.Wait()
-	if e := firstErr.Load(); e != nil {
-		return nil, e.(error)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	const parallelThreshold = 1024
@@ -366,6 +423,9 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 			var r_be [4]byte
 			hasher := ots_params.H.New()
 			for idx := uint32(0); idx < levelNodes; idx++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				r := rBase + idx
 				binary.BigEndian.PutUint32(r_be[:], r)
 				hasher.Reset()
@@ -400,6 +460,9 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 				var r_be [4]byte
 				hasher := ots_params.H.New()
 				for idx := start; idx < end; idx++ {
+					if ctx.Err() != nil {
+						return
+					}
 					r := rBase + idx
 					binary.BigEndian.PutUint32(r_be[:], r)
 					hasher.Reset()
@@ -413,6 +476,9 @@ func GeneratePKTree(tc common.LmsAlgorithmType, otstc common.LmsOtsAlgorithmType
 			}(start, end)
 		}
 		lwg.Wait()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	return authtree, nil
